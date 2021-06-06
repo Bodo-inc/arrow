@@ -182,6 +182,9 @@ cdef extern from "arrow/filesystem/api.h" namespace "arrow::fs" nogil:
                                   const c_string& external_id,
                                   const int load_frequency)
 
+        @staticmethod
+        CS3Options FromAssumeRoleWithWebIdentity()
+
     cdef cppclass CS3FileSystem "arrow::fs::S3FileSystem"(CFileSystem):
         @staticmethod
         CResult[shared_ptr[CS3FileSystem]] Make(const CS3Options& options)

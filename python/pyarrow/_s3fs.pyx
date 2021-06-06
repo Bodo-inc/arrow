@@ -23,7 +23,7 @@ from pyarrow.includes.common cimport *
 from pyarrow.includes.libarrow cimport *
 from pyarrow.includes.libarrow_fs cimport *
 from pyarrow._fs cimport FileSystem
-
+import warnings
 
 cpdef enum S3LogLevel:
     Off = <int8_t> CS3LogLevel_Off
@@ -61,28 +61,77 @@ cdef class S3FileSystem(FileSystem):
 
     Parameters
     ----------
+    auth: dict or str, default 'default'
+        It must be one of::
+
+            'default':
+                Use default mechanisms such as environment variables and 
+                AWS profiles.
+            'anonymous':
+                Connect anonymously. If set, will not attempt to
+                look up credentials using standard AWS configuration methods.
+            'web_identity':
+                Connect using an assumed role authenticated using
+                a web identity token. The required settings are derived from
+                environment variables such as AWS_ROLE_ARN,
+                AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_SESSION_NAME.
+                If set, will not attempt to look up credentials using other
+                AWS configuration methods.
+            {'access_key': '...', 'secret_key': '...', 'session_token': '...'}:
+                Use explicit credentials.
+                'access_key': str (required)
+                    AWS Access Key ID
+                'secret_key': str (required)
+                    AWS Secret Access key.
+                'session_token': str (optional)
+                    AWS Session Token.  An optional session token, required
+                    if access_key and secret_key  are temporary credentials
+                    from STS.
+            {'role_arn': '...', 'session_name': '...', 'external_id': '...', 
+             'load_frequency': 123}:
+                If provided instead of explicit credentials, temporary
+                credentials will be fetched by assuming this role.
+                'role_arn': str (required)
+                    AWS Role ARN.
+                'session_name': str (optional)
+                    An optional identifier for the assumed role session.
+                'external_id': str (optional)
+                    An optional unique identifier that might be required
+                    when you assume a role in another account.
+                'load_frequency': int, default 900
+                    The frequency (in seconds) with which temporary 
+                    credentials from an assumed role session will be
+                    refreshed.
     access_key: str, default None
+        DEPRECATED. Use 'auth' argument instead.
         AWS Access Key ID. Pass None to use the standard AWS environment
         variables and/or configuration file.
     secret_key: str, default None
+        DEPRECATED. Use 'auth' argument instead.
         AWS Secret Access key. Pass None to use the standard AWS environment
         variables and/or configuration file.
     session_token: str, default None
+        DEPRECATED. Use 'auth' argument instead.
         AWS Session Token.  An optional session token, required if access_key
         and secret_key are temporary credentials from STS.
     anonymous: boolean, default False
+        DEPRECATED. Use 'auth' argument instead.
         Whether to connect anonymously if access_key and secret_key are None.
         If true, will not attempt to look up credentials using standard AWS
         configuration methods.
     role_arn: str, default None
+        DEPRECATED. Use 'auth' argument instead.
         AWS Role ARN.  If provided instead of access_key and secret_key,
         temporary credentials will be fetched by assuming this role.
     session_name: str, default None
+        DEPRECATED. Use 'auth' argument instead.
         An optional identifier for the assumed role session.
     external_id: str, default None
+        DEPRECATED. Use 'auth' argument instead.
         An optional unique identifier that might be required when you assume
         a role in another account.
     load_frequency: int, default 900
+        DEPRECATED. Use 'auth' argument instead.
         The frequency (in seconds) with which temporary credentials from an
         assumed role session will be refreshed.
     region: str, default 'us-east-1'
@@ -112,7 +161,8 @@ cdef class S3FileSystem(FileSystem):
     cdef:
         CS3FileSystem* s3fs
 
-    def __init__(self, *, access_key=None, secret_key=None, session_token=None,
+    def __init__(self, *, auth='default', access_key=None,
+                 secret_key=None, session_token=None,
                  bint anonymous=False, region=None, scheme=None,
                  endpoint_override=None, bint background_writes=True,
                  role_arn=None, session_name=None, external_id=None,
@@ -121,6 +171,45 @@ cdef class S3FileSystem(FileSystem):
             CS3Options options
             shared_ptr[CS3FileSystem] wrapped
 
+        if isinstance(auth, str):
+            if auth == "default":
+                options = CS3Options.Defaults()
+            elif auth == "anonymous":
+                options = CS3Options.Anonymous()
+            elif auth == "web_identity":
+                options = CS3Options.FromAssumeRoleWithWebIdentity()
+            else:
+                raise ValueError(
+                    f"Invalid value '{auth}' provided for 'auth'."
+                )
+        elif isinstance(auth, dict):
+            if "access_key" in auth and "secret_key" in auth:
+                options = CS3Options.FromAccessKey(
+                    tobytes(auth['access_key']),
+                    tobytes(auth['secret_key']),
+                    tobytes(auth.get('session_token', ''))
+                )
+            elif "role_arn" in auth:
+                options = CS3Options.FromAssumeRole(
+                    tobytes(auth['role_arn']),
+                    tobytes(auth.get('session_name', '')),
+                    tobytes(auth.get('external_id', '')),
+                    auth.get('load_frequency', 900)
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported value: {auth} provided for 'auth'"
+                )
+        else:
+            raise ValueError(
+                f"Expected str or dict for 'auth', got {type(auth)} instead."
+            )
+
+        DEPR_MSG = ("The following arguments are being deprecated in "
+                    "favor of the new 'auth' argument:\n"
+                    "'access_key', 'secret_key', 'session_token', "
+                    "'anonymous', 'role_arn', 'session_name', "
+                    "'external_id', 'load_frequency'.")
         if access_key is not None and secret_key is None:
             raise ValueError(
                 'In order to initialize with explicit credentials both '
@@ -155,6 +244,7 @@ cdef class S3FileSystem(FileSystem):
             if session_token is None:
                 session_token = ""
 
+            warnings.warn(DEPR_MSG, FutureWarning, stacklevel=2)
             options = CS3Options.FromAccessKey(
                 tobytes(access_key),
                 tobytes(secret_key),
@@ -165,9 +255,11 @@ cdef class S3FileSystem(FileSystem):
                 raise ValueError(
                     'Cannot provide role_arn with anonymous=True')
 
+            warnings.warn(DEPR_MSG, FutureWarning, stacklevel=2)
             options = CS3Options.Anonymous()
         elif role_arn:
 
+            warnings.warn(DEPR_MSG, FutureWarning, stacklevel=2)
             options = CS3Options.FromAssumeRole(
                 tobytes(role_arn),
                 tobytes(session_name),
@@ -221,31 +313,34 @@ cdef class S3FileSystem(FileSystem):
     def __reduce__(self):
         cdef CS3Options opts = self.s3fs.options()
 
-        # if creds were explicitly provided, then use them
-        # else obtain them as they were last time.
-        if opts.credentials_kind == CS3CredentialsKind_Explicit:
-            access_key = frombytes(opts.GetAccessKey())
-            secret_key = frombytes(opts.GetSecretKey())
-            session_token = frombytes(opts.GetSessionToken())
+        if opts.credentials_kind == CS3CredentialsKind_Default:
+            auth = 'default'
+        elif opts.credentials_kind == CS3CredentialsKind_Anonymous:
+            auth = 'anonymous'
+        elif opts.credentials_kind == CS3CredentialsKind_WebIdentity:
+            auth = 'web_identity'
+        elif opts.credentials_kind == CS3CredentialsKind_Explicit:
+            auth = {
+                'access_key': frombytes(opts.GetAccessKey()),
+                'secret_key': frombytes(opts.GetSecretKey()),
+                'session_token': frombytes(opts.GetSessionToken()),
+            }
+        elif opts.credentials_kind == CS3CredentialsKind_Role:
+            auth = {
+                'role_arn': frombytes(opts.role_arn),
+                'session_name': frombytes(opts.session_name),
+                'external_id': frombytes(opts.external_id),
+                'load_frequency': opts.load_frequency,
+            }
         else:
-            access_key = None
-            secret_key = None
-            session_token = None
+            raise Exception("Unknown S3CredentialsKind encountered.")
 
         return (
             S3FileSystem._reconstruct, (dict(
-                access_key=access_key,
-                secret_key=secret_key,
-                session_token=session_token,
-                anonymous=(opts.credentials_kind ==
-                           CS3CredentialsKind_Anonymous),
+                auth=auth,
                 region=frombytes(opts.region),
                 scheme=frombytes(opts.scheme),
                 endpoint_override=frombytes(opts.endpoint_override),
-                role_arn=frombytes(opts.role_arn),
-                session_name=frombytes(opts.session_name),
-                external_id=frombytes(opts.external_id),
-                load_frequency=opts.load_frequency,
                 background_writes=opts.background_writes,
                 proxy_options={'scheme': frombytes(opts.proxy_options.scheme),
                                'host': frombytes(opts.proxy_options.host),
