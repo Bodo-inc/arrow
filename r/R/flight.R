@@ -21,8 +21,8 @@
 #' @param path file system path where the Python module is found. Default is
 #' to look in the `inst/` directory for included modules.
 #' @export
-#' @examples
-#' \dontrun{load_flight_server("demo_flight_server")}
+#' @examplesIf FALSE
+#' load_flight_server("demo_flight_server")
 load_flight_server <- function(name, path = system.file(package = "arrow")) {
   reticulate::import_from_path(name, path)
 }
@@ -107,7 +107,8 @@ list_flights <- function(client) {
 #' @rdname list_flights
 #' @export
 flight_path_exists <- function(client, path) {
-  it_exists <- tryCatch({
+  it_exists <- tryCatch(
+    expr = {
       client$get_flight_info(descriptor_for_path(path))
       TRUE
     },

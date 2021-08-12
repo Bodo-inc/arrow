@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <utility>
@@ -148,6 +149,8 @@ struct GetViewType<Decimal128Type> {
   static T LogicalValue(PhysicalType value) {
     return Decimal128(reinterpret_cast<const uint8_t*>(value.data()));
   }
+
+  static T LogicalValue(T value) { return value; }
 };
 
 template <>
@@ -158,6 +161,8 @@ struct GetViewType<Decimal256Type> {
   static T LogicalValue(PhysicalType value) {
     return Decimal256(reinterpret_cast<const uint8_t*>(value.data()));
   }
+
+  static T LogicalValue(T value) { return value; }
 };
 
 template <typename Type, typename Enable = void>
@@ -187,8 +192,8 @@ struct GetOutputType<Decimal256Type> {
 // Iteration / value access utilities
 
 template <typename T, typename R = void>
-using enable_if_has_c_type_not_boolean =
-    enable_if_t<has_c_type<T>::value && !is_boolean_type<T>::value, R>;
+using enable_if_c_number_or_decimal = enable_if_t<
+    (has_c_type<T>::value && !is_boolean_type<T>::value) || is_decimal_type<T>::value, R>;
 
 // Iterator over various input array types, yielding a GetViewType<Type>
 
@@ -196,8 +201,8 @@ template <typename Type, typename Enable = void>
 struct ArrayIterator;
 
 template <typename Type>
-struct ArrayIterator<Type, enable_if_has_c_type_not_boolean<Type>> {
-  using T = typename Type::c_type;
+struct ArrayIterator<Type, enable_if_c_number_or_decimal<Type>> {
+  using T = typename TypeTraits<Type>::ScalarType::ValueType;
   const T* values;
 
   explicit ArrayIterator(const ArrayData& data) : values(data.GetValues<T>(1)) {}
@@ -248,8 +253,8 @@ template <typename Type, typename Enable = void>
 struct OutputArrayWriter;
 
 template <typename Type>
-struct OutputArrayWriter<Type, enable_if_has_c_type_not_boolean<Type>> {
-  using T = typename Type::c_type;
+struct OutputArrayWriter<Type, enable_if_c_number_or_decimal<Type>> {
+  using T = typename TypeTraits<Type>::ScalarType::ValueType;
   T* values;
 
   explicit OutputArrayWriter(ArrayData* data) : values(data->GetMutableValues<T>(1)) {}
@@ -259,6 +264,10 @@ struct OutputArrayWriter<Type, enable_if_has_c_type_not_boolean<Type>> {
   // Note that this doesn't write the null bitmap, which should be consistent
   // with Write / WriteNull calls
   void WriteNull() { *values++ = T{}; }
+
+  void WriteAllNull(int64_t length) {
+    std::memset(static_cast<void*>(values), 0, sizeof(T) * length);
+  }
 };
 
 // (Un)box Scalar to / from C++ value
@@ -276,7 +285,7 @@ struct UnboxScalar<Type, enable_if_has_c_type<Type>> {
 };
 
 template <typename Type>
-struct UnboxScalar<Type, enable_if_base_binary<Type>> {
+struct UnboxScalar<Type, enable_if_has_string_view<Type>> {
   static util::string_view Unbox(const Scalar& val) {
     if (!val.is_valid) return util::string_view();
     return util::string_view(*checked_cast<const BaseBinaryScalar&>(val).value);
@@ -433,6 +442,9 @@ const std::vector<std::shared_ptr<DataType>>& NumericTypes();
 // Temporal types including time and timestamps for each unit
 const std::vector<std::shared_ptr<DataType>>& TemporalTypes();
 
+// Interval types
+const std::vector<std::shared_ptr<DataType>>& IntervalTypes();
+
 // Integer, floating point, base binary, and temporal
 const std::vector<std::shared_ptr<DataType>>& PrimitiveTypes();
 
@@ -516,11 +528,13 @@ struct OutputAdapter<Type, enable_if_boolean<Type>> {
 };
 
 template <typename Type>
-struct OutputAdapter<Type, enable_if_has_c_type_not_boolean<Type>> {
+struct OutputAdapter<Type, enable_if_c_number_or_decimal<Type>> {
+  using T = typename TypeTraits<Type>::ScalarType::ValueType;
+
   template <typename Generator>
   static Status Write(KernelContext*, Datum* out, Generator&& generator) {
     ArrayData* out_arr = out->mutable_array();
-    auto out_data = out_arr->GetMutableValues<typename Type::c_type>(1);
+    auto out_data = out_arr->GetMutableValues<T>(1);
     // TODO: Is this as fast as a more explicitly inlined function?
     for (int64_t i = 0; i < out_arr->length; ++i) {
       *out_data++ = generator();
@@ -616,8 +630,7 @@ struct ScalarUnaryNotNullStateful {
   };
 
   template <typename Type>
-  struct ArrayExec<
-      Type, enable_if_t<has_c_type<Type>::value && !is_boolean_type<Type>::value>> {
+  struct ArrayExec<Type, enable_if_c_number_or_decimal<Type>> {
     static Status Exec(const ThisType& functor, KernelContext* ctx, const ArrayData& arg0,
                        Datum* out) {
       Status st = Status::OK();
@@ -630,7 +643,7 @@ struct ScalarUnaryNotNullStateful {
           },
           [&]() {
             // null
-            ++out_data;
+            *out_data++ = OutValue{};
           });
       return st;
     }
@@ -680,27 +693,6 @@ struct ScalarUnaryNotNullStateful {
             out_writer.Next();
           });
       out_writer.Finish();
-      return st;
-    }
-  };
-
-  template <typename Type>
-  struct ArrayExec<Type, enable_if_decimal<Type>> {
-    static Status Exec(const ThisType& functor, KernelContext* ctx, const ArrayData& arg0,
-                       Datum* out) {
-      Status st = Status::OK();
-      ArrayData* out_arr = out->mutable_array();
-      // Decimal128 data buffers are not safely reinterpret_cast-able on big-endian
-      using endian_agnostic =
-          std::array<uint8_t, sizeof(typename TypeTraits<Type>::ScalarType::ValueType)>;
-      auto out_data = out_arr->GetMutableValues<endian_agnostic>(1);
-      VisitArrayValuesInline<Arg0Type>(
-          arg0,
-          [&](Arg0Value v) {
-            functor.op.template Call<OutValue, Arg0Value>(ctx, v, &st)
-                .ToBytes(out_data++->data());
-          },
-          [&]() { ++out_data; });
       return st;
     }
   };
@@ -771,7 +763,8 @@ struct ScalarBinary {
     ArrayIterator<Arg0Type> arg0_it(arg0);
     ArrayIterator<Arg1Type> arg1_it(arg1);
     RETURN_NOT_OK(OutputAdapter<OutType>::Write(ctx, out, [&]() -> OutValue {
-      return Op::template Call(ctx, arg0_it(), arg1_it(), &st);
+      return Op::template Call<OutValue, Arg0Value, Arg1Value>(ctx, arg0_it(), arg1_it(),
+                                                               &st);
     }));
     return st;
   }
@@ -782,7 +775,8 @@ struct ScalarBinary {
     ArrayIterator<Arg0Type> arg0_it(arg0);
     auto arg1_val = UnboxScalar<Arg1Type>::Unbox(arg1);
     RETURN_NOT_OK(OutputAdapter<OutType>::Write(ctx, out, [&]() -> OutValue {
-      return Op::template Call(ctx, arg0_it(), arg1_val, &st);
+      return Op::template Call<OutValue, Arg0Value, Arg1Value>(ctx, arg0_it(), arg1_val,
+                                                               &st);
     }));
     return st;
   }
@@ -793,7 +787,8 @@ struct ScalarBinary {
     auto arg0_val = UnboxScalar<Arg0Type>::Unbox(arg0);
     ArrayIterator<Arg1Type> arg1_it(arg1);
     RETURN_NOT_OK(OutputAdapter<OutType>::Write(ctx, out, [&]() -> OutValue {
-      return Op::template Call(ctx, arg0_val, arg1_it(), &st);
+      return Op::template Call<OutValue, Arg0Value, Arg1Value>(ctx, arg0_val, arg1_it(),
+                                                               &st);
     }));
     return st;
   }
@@ -804,8 +799,9 @@ struct ScalarBinary {
     if (out->scalar()->is_valid) {
       auto arg0_val = UnboxScalar<Arg0Type>::Unbox(arg0);
       auto arg1_val = UnboxScalar<Arg1Type>::Unbox(arg1);
-      BoxScalar<OutType>::Box(Op::template Call(ctx, arg0_val, arg1_val, &st),
-                              out->scalar().get());
+      BoxScalar<OutType>::Box(
+          Op::template Call<OutValue, Arg0Value, Arg1Value>(ctx, arg0_val, arg1_val, &st),
+          out->scalar().get());
     }
     return st;
   }
@@ -867,6 +863,8 @@ struct ScalarBinaryNotNullStateful {
                 op.template Call<OutValue, Arg0Value, Arg1Value>(ctx, u, arg1_val, &st));
           },
           [&]() { writer.WriteNull(); });
+    } else {
+      writer.WriteAllNull(out->mutable_array()->length);
     }
     return st;
   }
@@ -884,6 +882,8 @@ struct ScalarBinaryNotNullStateful {
                 op.template Call<OutValue, Arg0Value, Arg1Value>(ctx, arg0_val, v, &st));
           },
           [&]() { writer.WriteNull(); });
+    } else {
+      writer.WriteAllNull(out->mutable_array()->length);
     }
     return st;
   }
@@ -1159,25 +1159,26 @@ ArrayKernelExec GenerateSignedInteger(detail::GetTypeId get_id) {
 // bits).
 //
 // See "Numeric" above for description of the generator functor
-template <template <typename...> class Generator>
+template <template <typename...> class Generator, typename... Args>
 ArrayKernelExec GenerateTypeAgnosticPrimitive(detail::GetTypeId get_id) {
   switch (get_id.id) {
     case Type::NA:
-      return Generator<NullType>::Exec;
+      return Generator<NullType, Args...>::Exec;
     case Type::BOOL:
-      return Generator<BooleanType>::Exec;
+      return Generator<BooleanType, Args...>::Exec;
     case Type::UINT8:
     case Type::INT8:
-      return Generator<UInt8Type>::Exec;
+      return Generator<UInt8Type, Args...>::Exec;
     case Type::UINT16:
     case Type::INT16:
-      return Generator<UInt16Type>::Exec;
+      return Generator<UInt16Type, Args...>::Exec;
     case Type::UINT32:
     case Type::INT32:
     case Type::FLOAT:
     case Type::DATE32:
     case Type::TIME32:
-      return Generator<UInt32Type>::Exec;
+    case Type::INTERVAL_MONTHS:
+      return Generator<UInt32Type, Args...>::Exec;
     case Type::UINT64:
     case Type::INT64:
     case Type::DOUBLE:
@@ -1185,7 +1186,8 @@ ArrayKernelExec GenerateTypeAgnosticPrimitive(detail::GetTypeId get_id) {
     case Type::TIMESTAMP:
     case Type::TIME64:
     case Type::DURATION:
-      return Generator<UInt64Type>::Exec;
+    case Type::INTERVAL_DAY_TIME:
+      return Generator<UInt64Type, Args...>::Exec;
     default:
       DCHECK(false);
       return ExecFail;
@@ -1193,15 +1195,15 @@ ArrayKernelExec GenerateTypeAgnosticPrimitive(detail::GetTypeId get_id) {
 }
 
 // similar to GenerateTypeAgnosticPrimitive, but for variable types
-template <template <typename...> class Generator>
+template <template <typename...> class Generator, typename... Args>
 ArrayKernelExec GenerateTypeAgnosticVarBinaryBase(detail::GetTypeId get_id) {
   switch (get_id.id) {
     case Type::BINARY:
     case Type::STRING:
-      return Generator<BinaryType>::Exec;
+      return Generator<BinaryType, Args...>::Exec;
     case Type::LARGE_BINARY:
     case Type::LARGE_STRING:
-      return Generator<LargeBinaryType>::Exec;
+      return Generator<LargeBinaryType, Args...>::Exec;
     default:
       DCHECK(false);
       return ExecFail;
@@ -1301,6 +1303,9 @@ void ReplaceTypes(const std::shared_ptr<DataType>&, std::vector<ValueDescr>* des
 
 ARROW_EXPORT
 std::shared_ptr<DataType> CommonNumeric(const std::vector<ValueDescr>& descrs);
+
+ARROW_EXPORT
+std::shared_ptr<DataType> CommonNumeric(const ValueDescr* begin, size_t count);
 
 ARROW_EXPORT
 std::shared_ptr<DataType> CommonTimestamp(const std::vector<ValueDescr>& descrs);

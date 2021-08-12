@@ -31,16 +31,17 @@
 #' @rdname Field
 #' @name Field
 #' @export
-Field <- R6Class("Field", inherit = ArrowObject,
+Field <- R6Class("Field",
+  inherit = ArrowObject,
   public = list(
     ToString = function() {
       prettier_dictionary_type(Field__ToString(self))
     },
     Equals = function(other, ...) {
       inherits(other, "Field") && Field__Equals(self, other)
-    }
+    },
+    export_to_c = function(ptr) ExportField(self, ptr)
   ),
-
   active = list(
     name = function() {
       Field__name(self)
@@ -59,6 +60,8 @@ Field$create <- function(name, type, metadata) {
   assert_that(missing(metadata), msg = "metadata= is currently ignored")
   Field__initialize(enc2utf8(name), type, TRUE)
 }
+#' @include arrowExports.R
+Field$import_from_c <- ImportField
 
 #' @param name field name
 #' @param type logical type, instance of [DataType]

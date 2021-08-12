@@ -63,12 +63,18 @@ class Lexer {
       case IN_FIELD:
         goto InField;
       case AT_ESCAPE:
+        // will never reach here if escaping = false
+        // just to hint the compiler to remove dead code
+        if (!escaping) return nullptr;
         goto AtEscape;
       case IN_QUOTED_FIELD:
+        if (!quoting) return nullptr;
         goto InQuotedField;
       case AT_QUOTED_QUOTE:
+        if (!quoting) return nullptr;
         goto AtQuotedQuote;
       case AT_QUOTED_ESCAPE:
+        if (!quoting) return nullptr;
         goto AtQuotedEscape;
     }
 
@@ -171,6 +177,7 @@ class Lexer {
     goto FieldStart;
 
   LineEnd:
+    state_ = FIELD_START;
     return data;
 
   AbortLine:
@@ -231,6 +238,39 @@ class LexingBoundaryFinder : public BoundaryFinder {
       *out_pos = static_cast<int64_t>(data - block.data());
       DCHECK_GT(*out_pos, 0);
     }
+    return Status::OK();
+  }
+
+  Status FindNth(util::string_view partial, util::string_view block, int64_t count,
+                 int64_t* out_pos, int64_t* num_found) override {
+    Lexer<quoting, escaping> lexer(options_);
+    int64_t found = 0;
+    const char* data = block.data();
+    const char* const data_end = block.data() + block.size();
+
+    const char* line_end;
+    if (partial.size()) {
+      line_end = lexer.ReadLine(partial.data(), partial.data() + partial.size());
+      DCHECK_EQ(line_end, nullptr);  // Otherwise `partial` is a whole CSV line
+    }
+
+    for (; data < data_end && found < count; ++found) {
+      line_end = lexer.ReadLine(data, data_end);
+      if (line_end == nullptr) {
+        // Cannot read any further
+        break;
+      }
+      DCHECK_GT(line_end, data);
+      data = line_end;
+    }
+
+    if (data == block.data()) {
+      // No complete CSV line
+      *out_pos = kNoDelimiterFound;
+    } else {
+      *out_pos = static_cast<int64_t>(data - block.data());
+    }
+    *num_found = found;
     return Status::OK();
   }
 

@@ -558,6 +558,35 @@ void ReadSingleColumnFileStatistics(std::unique_ptr<FileReader> file_reader,
   ASSERT_OK(StatisticsAsScalars(*statistics, min, max));
 }
 
+void DownsampleInt96RoundTrip(std::shared_ptr<Array> arrow_vector_in,
+                              std::shared_ptr<Array> arrow_vector_out,
+                              ::arrow::TimeUnit::type unit) {
+  // Create single input table of NS to be written to parquet with INT96
+  auto input_schema =
+      ::arrow::schema({::arrow::field("f", ::arrow::timestamp(TimeUnit::NANO))});
+  auto input = Table::Make(input_schema, {arrow_vector_in});
+
+  // Create an expected schema for each resulting table (one for each "downsampled" ts)
+  auto ex_schema = ::arrow::schema({::arrow::field("f", ::arrow::timestamp(unit))});
+  auto ex_result = Table::Make(ex_schema, {arrow_vector_out});
+
+  std::shared_ptr<Table> result;
+
+  ArrowReaderProperties arrow_reader_prop;
+  arrow_reader_prop.set_coerce_int96_timestamp_unit(unit);
+
+  ASSERT_NO_FATAL_FAILURE(DoRoundtrip(
+      input, input->num_rows(), &result, default_writer_properties(),
+      ArrowWriterProperties::Builder().enable_deprecated_int96_timestamps()->build(),
+      arrow_reader_prop));
+
+  ASSERT_NO_FATAL_FAILURE(::arrow::AssertSchemaEqual(*ex_result->schema(),
+                                                     *result->schema(),
+                                                     /*check_metadata=*/false));
+
+  ASSERT_NO_FATAL_FAILURE(::arrow::AssertTablesEqual(*ex_result, *result));
+}
+
 // Non-template base class for TestParquetIO, to avoid code duplication
 class ParquetIOTestBase : public ::testing::Test {
  public:
@@ -1671,6 +1700,33 @@ TEST(TestArrowReadWrite, UseDeprecatedInt96) {
   ASSERT_NO_FATAL_FAILURE(::arrow::AssertTablesEqual(*ex_result, *result));
 }
 
+TEST(TestArrowReadWrite, DownsampleDeprecatedInt96) {
+  using ::arrow::ArrayFromJSON;
+  using ::arrow::field;
+  using ::arrow::schema;
+
+  // Timestamp values at 2000-01-01 00:00:00,
+  // then with increment unit of 1ns, 1us, 1ms and 1s.
+  auto a_nano =
+      ArrayFromJSON(timestamp(TimeUnit::NANO),
+                    "[946684800000000000, 946684800000000001, 946684800000001000, "
+                    "946684800001000000, 946684801000000000]");
+  auto a_micro = ArrayFromJSON(timestamp(TimeUnit::MICRO),
+                               "[946684800000000, 946684800000000, 946684800000001, "
+                               "946684800001000, 946684801000000]");
+  auto a_milli = ArrayFromJSON(
+      timestamp(TimeUnit::MILLI),
+      "[946684800000, 946684800000, 946684800000, 946684800001, 946684801000]");
+  auto a_second =
+      ArrayFromJSON(timestamp(TimeUnit::SECOND),
+                    "[946684800, 946684800, 946684800, 946684800, 946684801]");
+
+  ASSERT_NO_FATAL_FAILURE(DownsampleInt96RoundTrip(a_nano, a_nano, TimeUnit::NANO));
+  ASSERT_NO_FATAL_FAILURE(DownsampleInt96RoundTrip(a_nano, a_micro, TimeUnit::MICRO));
+  ASSERT_NO_FATAL_FAILURE(DownsampleInt96RoundTrip(a_nano, a_milli, TimeUnit::MILLI));
+  ASSERT_NO_FATAL_FAILURE(DownsampleInt96RoundTrip(a_nano, a_second, TimeUnit::SECOND));
+}
+
 TEST(TestArrowReadWrite, CoerceTimestamps) {
   using ::arrow::ArrayFromVector;
   using ::arrow::field;
@@ -2287,10 +2343,9 @@ TEST(TestArrowReadWrite, WaitCoalescedReads) {
   ASSERT_OK(builder.Open(std::make_shared<BufferReader>(buffer)));
   ASSERT_OK(builder.properties(properties)->Build(&reader));
   // Pre-buffer data and wait for I/O to complete.
-  ASSERT_OK(reader->parquet_reader()
-                ->PreBuffer({0}, {0, 1, 2, 3, 4}, ::arrow::io::IOContext(),
-                            ::arrow::io::CacheOptions::Defaults())
-                .status());
+  reader->parquet_reader()->PreBuffer({0}, {0, 1, 2, 3, 4}, ::arrow::io::IOContext(),
+                                      ::arrow::io::CacheOptions::Defaults());
+  ASSERT_OK(reader->parquet_reader()->WhenBuffered({0}, {0, 1, 2, 3, 4}).status());
 
   std::shared_ptr<::arrow::RecordBatchReader> rb_reader;
   ASSERT_OK_NO_THROW(reader->GetRecordBatchReader({0}, {0, 1, 2, 3, 4}, &rb_reader));
@@ -2329,6 +2384,66 @@ TEST(TestArrowReadWrite, GetRecordBatchReaderNoColumns) {
   ASSERT_NE(actual_batch, nullptr);
   ASSERT_EQ(actual_batch->num_columns(), 0);
   ASSERT_EQ(actual_batch->num_rows(), num_rows);
+}
+
+TEST(TestArrowReadWrite, GetRecordBatchGenerator) {
+  ArrowReaderProperties properties = default_arrow_reader_properties();
+  const int num_rows = 1024;
+  const int row_group_size = 512;
+  const int num_columns = 2;
+
+  std::shared_ptr<Table> table;
+  ASSERT_NO_FATAL_FAILURE(MakeDoubleTable(num_columns, num_rows, 1, &table));
+
+  std::shared_ptr<Buffer> buffer;
+  ASSERT_NO_FATAL_FAILURE(WriteTableToBuffer(table, row_group_size,
+                                             default_arrow_writer_properties(), &buffer));
+
+  std::shared_ptr<FileReader> reader;
+  {
+    std::unique_ptr<FileReader> unique_reader;
+    FileReaderBuilder builder;
+    ASSERT_OK(builder.Open(std::make_shared<BufferReader>(buffer)));
+    ASSERT_OK(builder.properties(properties)->Build(&unique_reader));
+    reader = std::move(unique_reader);
+  }
+
+  auto check_batches = [](const std::shared_ptr<::arrow::RecordBatch>& batch,
+                          int num_columns, int num_rows) {
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->num_columns(), num_columns);
+    ASSERT_EQ(batch->num_rows(), num_rows);
+  };
+  {
+    ASSERT_OK_AND_ASSIGN(auto batch_generator,
+                         reader->GetRecordBatchGenerator(reader, {0, 1}, {0, 1}));
+    auto fut1 = batch_generator();
+    auto fut2 = batch_generator();
+    auto fut3 = batch_generator();
+    ASSERT_OK_AND_ASSIGN(auto batch1, fut1.result());
+    ASSERT_OK_AND_ASSIGN(auto batch2, fut2.result());
+    ASSERT_OK_AND_ASSIGN(auto batch3, fut3.result());
+    ASSERT_EQ(batch3, nullptr);
+    check_batches(batch1, num_columns, row_group_size);
+    check_batches(batch2, num_columns, row_group_size);
+    ASSERT_OK_AND_ASSIGN(auto actual, ::arrow::Table::FromRecordBatches(
+                                          batch1->schema(), {batch1, batch2}));
+    AssertTablesEqual(*table, *actual, /*same_chunk_layout=*/false);
+  }
+  {
+    // No columns case
+    ASSERT_OK_AND_ASSIGN(auto batch_generator,
+                         reader->GetRecordBatchGenerator(reader, {0, 1}, {}));
+    auto fut1 = batch_generator();
+    auto fut2 = batch_generator();
+    auto fut3 = batch_generator();
+    ASSERT_OK_AND_ASSIGN(auto batch1, fut1.result());
+    ASSERT_OK_AND_ASSIGN(auto batch2, fut2.result());
+    ASSERT_OK_AND_ASSIGN(auto batch3, fut3.result());
+    ASSERT_EQ(batch3, nullptr);
+    check_batches(batch1, 0, row_group_size);
+    check_batches(batch2, 0, row_group_size);
+  }
 }
 
 TEST(TestArrowReadWrite, ScanContents) {
@@ -2700,7 +2815,7 @@ TEST(ArrowReadWrite, Decimal256) {
 
   auto type = ::arrow::decimal256(8, 4);
 
-  const char* json = R"(["1.0000", null, "-1.2345", "-1000.5678", 
+  const char* json = R"(["1.0000", null, "-1.2345", "-1000.5678",
                          "-9999.9999", "9999.9999"])";
   auto array = ::arrow::ArrayFromJSON(type, json);
   auto table = ::arrow::Table::Make(::arrow::schema({field("root", type)}), {array});
@@ -3680,6 +3795,110 @@ TEST(TestArrowWriterAdHoc, SchemaMismatch) {
   auto tbl = ::arrow::Table::Make(table_schm, {col});
   ASSERT_RAISES(Invalid, writer->WriteTable(*tbl, 1));
 }
+
+class TestArrowWriteDictionary : public ::testing::TestWithParam<ParquetDataPageVersion> {
+ public:
+  ParquetDataPageVersion GetParquetDataPageVersion() { return GetParam(); }
+};
+
+TEST_P(TestArrowWriteDictionary, Statistics) {
+  std::vector<std::shared_ptr<::arrow::Array>> test_dictionaries = {
+      ArrayFromJSON(::arrow::utf8(), R"(["b", "c", "d", "a", "b", "c", "d", "a"])"),
+      ArrayFromJSON(::arrow::utf8(), R"(["b", "c", "d", "a", "b", "c", "d", "a"])"),
+      ArrayFromJSON(::arrow::binary(), R"(["d", "c", "b", "a", "d", "c", "b", "a"])"),
+      ArrayFromJSON(::arrow::large_utf8(), R"(["a", "b", "c", "a", "b", "c"])")};
+  std::vector<std::shared_ptr<::arrow::Array>> test_indices = {
+      ArrayFromJSON(::arrow::int32(), R"([0, null, 3, 0, null, 3])"),
+      ArrayFromJSON(::arrow::int32(), R"([0, 1, null, 0, 1, null])"),
+      ArrayFromJSON(::arrow::int32(), R"([0, 1, 3, 0, 1, 3])"),
+      ArrayFromJSON(::arrow::int32(), R"([null, null, null, null, null, null])")};
+  // Arrays will be written with 3 values per row group, 2 values per data page.  The
+  // row groups are identical for ease of testing.
+  std::vector<int32_t> expected_valid_counts = {2, 2, 3, 0};
+  std::vector<int32_t> expected_null_counts = {1, 1, 0, 3};
+  std::vector<int> expected_num_data_pages = {2, 2, 2, 1};
+  std::vector<std::vector<int32_t>> expected_valid_by_page = {
+      {1, 1}, {2, 0}, {2, 1}, {0}};
+  std::vector<std::vector<int64_t>> expected_null_by_page = {{1, 0}, {0, 1}, {0, 0}, {3}};
+  std::vector<int32_t> expected_dict_counts = {4, 4, 4, 3};
+  // Pairs of (min, max)
+  std::vector<std::vector<std::string>> expected_min_max_ = {
+      {"a", "b"}, {"b", "c"}, {"a", "d"}, {"", ""}};
+
+  for (std::size_t case_index = 0; case_index < test_dictionaries.size(); case_index++) {
+    SCOPED_TRACE(test_dictionaries[case_index]->type()->ToString());
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<::arrow::Array> dict_encoded,
+                         ::arrow::DictionaryArray::FromArrays(
+                             test_indices[case_index], test_dictionaries[case_index]));
+    std::shared_ptr<::arrow::Schema> schema =
+        ::arrow::schema({::arrow::field("values", dict_encoded->type())});
+    std::shared_ptr<::arrow::Table> table = ::arrow::Table::Make(schema, {dict_encoded});
+
+    std::shared_ptr<::arrow::ResizableBuffer> serialized_data = AllocateBuffer();
+    auto out_stream = std::make_shared<::arrow::io::BufferOutputStream>(serialized_data);
+    std::shared_ptr<WriterProperties> writer_properties =
+        WriterProperties::Builder()
+            .max_row_group_length(3)
+            ->data_page_version(this->GetParquetDataPageVersion())
+            ->write_batch_size(2)
+            ->data_pagesize(2)
+            ->build();
+    std::unique_ptr<FileWriter> writer;
+    ASSERT_OK(FileWriter::Open(*schema, ::arrow::default_memory_pool(), out_stream,
+                               writer_properties, default_arrow_writer_properties(),
+                               &writer));
+    ASSERT_OK(writer->WriteTable(*table, std::numeric_limits<int64_t>::max()));
+    ASSERT_OK(writer->Close());
+    ASSERT_OK(out_stream->Close());
+
+    auto buffer_reader = std::make_shared<::arrow::io::BufferReader>(serialized_data);
+    std::unique_ptr<ParquetFileReader> parquet_reader =
+        ParquetFileReader::Open(std::move(buffer_reader));
+
+    // Check row group statistics
+    std::shared_ptr<FileMetaData> metadata = parquet_reader->metadata();
+    ASSERT_EQ(metadata->num_row_groups(), 2);
+    for (int row_group_index = 0; row_group_index < 2; row_group_index++) {
+      ASSERT_EQ(metadata->RowGroup(row_group_index)->num_columns(), 1);
+      std::shared_ptr<Statistics> stats =
+          metadata->RowGroup(row_group_index)->ColumnChunk(0)->statistics();
+
+      EXPECT_EQ(stats->num_values(), expected_valid_counts[case_index]);
+      EXPECT_EQ(stats->null_count(), expected_null_counts[case_index]);
+
+      std::vector<std::string> case_expected_min_max = expected_min_max_[case_index];
+      EXPECT_EQ(stats->EncodeMin(), case_expected_min_max[0]);
+      EXPECT_EQ(stats->EncodeMax(), case_expected_min_max[1]);
+    }
+
+    for (int row_group_index = 0; row_group_index < 2; row_group_index++) {
+      std::unique_ptr<PageReader> page_reader =
+          parquet_reader->RowGroup(row_group_index)->GetColumnPageReader(0);
+      std::shared_ptr<Page> page = page_reader->NextPage();
+      ASSERT_NE(page, nullptr);
+      DictionaryPage* dict_page = (DictionaryPage*)page.get();
+      ASSERT_EQ(dict_page->num_values(), expected_dict_counts[case_index]);
+      for (int page_index = 0; page_index < expected_num_data_pages[case_index];
+           page_index++) {
+        page = page_reader->NextPage();
+        ASSERT_NE(page, nullptr);
+        DataPage* data_page = (DataPage*)page.get();
+        const EncodedStatistics& stats = data_page->statistics();
+        EXPECT_EQ(stats.null_count, expected_null_by_page[case_index][page_index]);
+        EXPECT_EQ(stats.has_min, false);
+        EXPECT_EQ(stats.has_max, false);
+        EXPECT_EQ(data_page->num_values(),
+                  expected_valid_by_page[case_index][page_index] +
+                      expected_null_by_page[case_index][page_index]);
+      }
+      ASSERT_EQ(page_reader->NextPage(), nullptr);
+    }
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(WriteDictionary, TestArrowWriteDictionary,
+                         ::testing::Values(ParquetDataPageVersion::V1,
+                                           ParquetDataPageVersion::V2));
 
 // ----------------------------------------------------------------------
 // Tests for directly reading DictionaryArray

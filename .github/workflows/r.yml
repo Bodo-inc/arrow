@@ -57,8 +57,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        r: ["3.6"]
-        ubuntu: [18.04]
+        r: ["4.1"]
+        ubuntu: [20.04]
     env:
       R: ${{ matrix.r }}
       UBUNTU: ${{ matrix.ubuntu }}
@@ -89,7 +89,9 @@ jobs:
         run: |
           sudo sysctl -w kernel.core_pattern="core.%e.%p"
           ulimit -c unlimited
-          archery docker run ubuntu-r
+          # Setting a non-default and non-probable Marquesas French Polynesia time
+          # it has both with a .45 offset and very very few people who live there.
+          archery docker run -e TZ=MART ubuntu-r
       - name: Dump install logs
         run: cat r/check/arrow.Rcheck/00install.out
         if: always()
@@ -147,7 +149,10 @@ jobs:
         run: |
           sudo sysctl -w kernel.core_pattern="core.%e.%p"
           ulimit -c unlimited
-          archery docker run r
+          # Don't set a TZ here to test that case. These builds will have the following warning in them:
+          #   System has not been booted with systemd as init system (PID 1). Can't operate.
+          #   Failed to connect to bus: Host is down
+          archery docker run -e TZ="" r
       - name: Dump install logs
         run: cat r/check/arrow.Rcheck/00install.out
         if: always()
@@ -214,7 +219,7 @@ jobs:
       - uses: r-lib/actions/setup-r@master
         with:
           rtools-version: 40
-          r-version: "4.0"
+          r-version: "4.1"
           Ncpus: 2
       - uses: r-lib/actions/setup-r@master
         if: ${{ matrix.rtools == 35 }}
@@ -242,7 +247,8 @@ jobs:
         run: |
           Sys.setenv(
             RWINLIB_LOCAL = file.path(Sys.getenv("GITHUB_WORKSPACE"), "libarrow.zip"),
-            MAKEFLAGS = paste0("-j", parallel::detectCores())
+            MAKEFLAGS = paste0("-j", parallel::detectCores()),
+            "_R_CHECK_FORCE_SUGGESTS_" = FALSE
           )
           rcmdcheck::rcmdcheck("r",
             build_args = '--no-build-vignettes',

@@ -83,6 +83,7 @@ within the array's internal data. This can be an expensive check, potentially \c
 }
 
 \examples{
+\dontshow{if (arrow_available()) (if (getRversion() >= "3.4") withAutoprint else force)(\{ # examplesIf}
 my_array <- Array$create(1:10)
 my_array$type
 my_array$cast(int8())
@@ -99,8 +100,8 @@ new_array <- na_array$Slice(5)
 new_array$offset
 
 # Compare 2 arrays
-na_array2 = na_array
+na_array2 <- na_array
 na_array2 == na_array # element-wise comparison
-na_array2$Equals(na_array) # overall comparison 
-
+na_array2$Equals(na_array) # overall comparison
+\dontshow{\}) # examplesIf}
 }

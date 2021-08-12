@@ -23,8 +23,9 @@
 #include <unordered_set>
 #include <vector>
 
+#include "arrow/compute/exec/forest_internal.h"
+#include "arrow/compute/exec/subtree_internal.h"
 #include "arrow/dataset/dataset_internal.h"
-#include "arrow/dataset/forest_internal.h"
 #include "arrow/dataset/scanner.h"
 #include "arrow/dataset/scanner_internal.h"
 #include "arrow/filesystem/filesystem.h"
@@ -36,6 +37,7 @@
 #include "arrow/util/compression.h"
 #include "arrow/util/iterator.h"
 #include "arrow/util/logging.h"
+#include "arrow/util/macros.h"
 #include "arrow/util/make_unique.h"
 #include "arrow/util/map.h"
 #include "arrow/util/mutex.h"
@@ -188,7 +190,7 @@ Future<util::optional<int64_t>> FileFragment::CountRows(
 
 struct FileSystemDataset::FragmentSubtrees {
   // Forest for skipping fragments based on extracted subtree expressions
-  Forest forest;
+  compute::Forest forest;
   // fragment indices and subtree expressions in forest order
   std::vector<util::Variant<int, compute::Expression>> fragments_and_subtrees;
 };
@@ -196,12 +198,14 @@ struct FileSystemDataset::FragmentSubtrees {
 Result<std::shared_ptr<FileSystemDataset>> FileSystemDataset::Make(
     std::shared_ptr<Schema> schema, compute::Expression root_partition,
     std::shared_ptr<FileFormat> format, std::shared_ptr<fs::FileSystem> filesystem,
-    std::vector<std::shared_ptr<FileFragment>> fragments) {
+    std::vector<std::shared_ptr<FileFragment>> fragments,
+    std::shared_ptr<Partitioning> partitioning) {
   std::shared_ptr<FileSystemDataset> out(
       new FileSystemDataset(std::move(schema), std::move(root_partition)));
   out->format_ = std::move(format);
   out->filesystem_ = std::move(filesystem);
   out->fragments_ = std::move(fragments);
+  out->partitioning_ = std::move(partitioning);
   out->SetupSubtreePruning();
   return out;
 }
@@ -243,43 +247,24 @@ std::string FileSystemDataset::ToString() const {
 
 void FileSystemDataset::SetupSubtreePruning() {
   subtrees_ = std::make_shared<FragmentSubtrees>();
-  SubtreeImpl impl;
+  compute::SubtreeImpl impl;
 
-  auto encoded = impl.EncodeFragments(fragments_);
+  auto encoded = impl.EncodeGuarantees(
+      [&](int index) { return fragments_[index]->partition_expression(); },
+      static_cast<int>(fragments_.size()));
 
-  std::sort(encoded.begin(), encoded.end(),
-            [](const SubtreeImpl::Encoded& l, const SubtreeImpl::Encoded& r) {
-              const auto cmp = l.partition_expression.compare(r.partition_expression);
-              if (cmp != 0) {
-                return cmp < 0;
-              }
-              // Equal partition expressions; sort encodings with fragment indices after
-              // encodings without
-              return (l.fragment_index ? 1 : 0) < (r.fragment_index ? 1 : 0);
-            });
+  std::sort(encoded.begin(), encoded.end(), compute::SubtreeImpl::ByGuarantee());
 
   for (const auto& e : encoded) {
-    if (e.fragment_index) {
-      subtrees_->fragments_and_subtrees.emplace_back(*e.fragment_index);
+    if (e.index) {
+      subtrees_->fragments_and_subtrees.emplace_back(*e.index);
     } else {
       subtrees_->fragments_and_subtrees.emplace_back(impl.GetSubtreeExpression(e));
     }
   }
 
-  subtrees_->forest = Forest(static_cast<int>(encoded.size()), [&](int l, int r) {
-    if (encoded[l].fragment_index) {
-      // Fragment: not an ancestor.
-      return false;
-    }
-
-    const auto& ancestor = encoded[l].partition_expression;
-    const auto& descendant = encoded[r].partition_expression;
-
-    if (descendant.size() >= ancestor.size()) {
-      return std::equal(ancestor.begin(), ancestor.end(), descendant.begin());
-    }
-    return false;
-  });
+  subtrees_->forest = compute::Forest(static_cast<int>(encoded.size()),
+                                      compute::SubtreeImpl::IsAncestor{encoded});
 }
 
 Result<FragmentIterator> FileSystemDataset::GetFragmentsImpl(
@@ -293,7 +278,7 @@ Result<FragmentIterator> FileSystemDataset::GetFragmentsImpl(
 
   std::vector<compute::Expression> predicates{predicate};
   RETURN_NOT_OK(subtrees_->forest.Visit(
-      [&](Forest::Ref ref) -> Result<bool> {
+      [&](compute::Forest::Ref ref) -> Result<bool> {
         if (auto fragment_index =
                 util::get_if<int>(&subtrees_->fragments_and_subtrees[ref.i])) {
           fragment_indices.push_back(*fragment_index);
@@ -312,7 +297,7 @@ Result<FragmentIterator> FileSystemDataset::GetFragmentsImpl(
         predicates.push_back(std::move(simplified));
         return true;
       },
-      [&](Forest::Ref ref) { predicates.pop_back(); }));
+      [&](compute::Forest::Ref ref) { predicates.pop_back(); }));
 
   std::sort(fragment_indices.begin(), fragment_indices.end());
 
@@ -418,7 +403,8 @@ class WriteQueue {
 
     ARROW_ASSIGN_OR_RAISE(
         writer_, write_options.format()->MakeWriter(std::move(destination), schema_,
-                                                    write_options.file_write_options));
+                                                    write_options.file_write_options,
+                                                    {write_options.filesystem, path}));
     return Status::OK();
   }
 
@@ -445,15 +431,15 @@ struct WriteState {
   std::unordered_map<std::string, std::unique_ptr<WriteQueue>> queues;
 };
 
-Status WriteNextBatch(WriteState& state, const std::shared_ptr<Fragment>& fragment,
+Status WriteNextBatch(WriteState* state, const std::shared_ptr<Fragment>& fragment,
                       std::shared_ptr<RecordBatch> batch) {
-  ARROW_ASSIGN_OR_RAISE(auto groups, state.write_options.partitioning->Partition(batch));
+  ARROW_ASSIGN_OR_RAISE(auto groups, state->write_options.partitioning->Partition(batch));
   batch.reset();  // drop to hopefully conserve memory
 
-  if (groups.batches.size() > static_cast<size_t>(state.write_options.max_partitions)) {
+  if (groups.batches.size() > static_cast<size_t>(state->write_options.max_partitions)) {
     return Status::Invalid("Fragment would be written into ", groups.batches.size(),
                            " partitions. This exceeds the maximum of ",
-                           state.write_options.max_partitions);
+                           state->write_options.max_partitions);
   }
 
   std::unordered_set<WriteQueue*> need_flushed;
@@ -462,20 +448,20 @@ Status WriteNextBatch(WriteState& state, const std::shared_ptr<Fragment>& fragme
         and_(std::move(groups.expressions[i]), fragment->partition_expression());
     auto batch = std::move(groups.batches[i]);
 
-    ARROW_ASSIGN_OR_RAISE(auto part,
-                          state.write_options.partitioning->Format(partition_expression));
+    ARROW_ASSIGN_OR_RAISE(
+        auto part, state->write_options.partitioning->Format(partition_expression));
 
     WriteQueue* queue;
     {
       // lookup the queue to which batch should be appended
-      auto queues_lock = state.mutex.Lock();
+      auto queues_lock = state->mutex.Lock();
 
       queue = internal::GetOrInsertGenerated(
-                  &state.queues, std::move(part),
+                  &state->queues, std::move(part),
                   [&](const std::string& emplaced_part) {
                     // lookup in `queues` also failed,
                     // generate a new WriteQueue
-                    size_t queue_index = state.queues.size() - 1;
+                    size_t queue_index = state->queues.size() - 1;
 
                     return internal::make_unique<WriteQueue>(emplaced_part, queue_index,
                                                              batch->schema());
@@ -489,12 +475,12 @@ Status WriteNextBatch(WriteState& state, const std::shared_ptr<Fragment>& fragme
 
   // flush all touched WriteQueues
   for (auto queue : need_flushed) {
-    RETURN_NOT_OK(queue->Flush(state.write_options));
+    RETURN_NOT_OK(queue->Flush(state->write_options));
   }
   return Status::OK();
 }
 
-Status WriteInternal(const ScanOptions& scan_options, WriteState& state,
+Status WriteInternal(const ScanOptions& scan_options, WriteState* state,
                      ScanTaskVector scan_tasks) {
   // Store a mapping from partitions (represened by their formatted partition expressions)
   // to a WriteQueue which flushes batches into that partition's output file. In principle
@@ -536,30 +522,24 @@ Status FileSystemDataset::Write(const FileSystemDatasetWriteOptions& write_optio
   // NB: neither of these will have any impact whatsoever on the common case of writing
   //     an in-memory table to disk.
 
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-#elif defined(_MSC_VER)
-#pragma warning(push)
-#pragma warning(disable : 4996)
-#endif
+  ARROW_SUPPRESS_DEPRECATION_WARNING
 
-  // TODO: (ARROW-11782/ARROW-12288) Remove calls to Scan()
+  // TODO(ARROW-11782/ARROW-12288) Remove calls to Scan()
   ARROW_ASSIGN_OR_RAISE(auto scan_task_it, scanner->Scan());
   ARROW_ASSIGN_OR_RAISE(ScanTaskVector scan_tasks, scan_task_it.ToVector());
 
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic pop
-#elif defined(_MSC_VER)
-#pragma warning(pop)
-#endif
+  ARROW_UNSUPPRESS_DEPRECATION_WARNING
 
   WriteState state(write_options);
-  RETURN_NOT_OK(WriteInternal(*scanner->options(), state, std::move(scan_tasks)));
+  RETURN_NOT_OK(WriteInternal(*scanner->options(), &state, std::move(scan_tasks)));
 
   auto task_group = scanner->options()->TaskGroup();
   for (const auto& part_queue : state.queues) {
-    task_group->Append([&] { return part_queue.second->writer()->Finish(); });
+    task_group->Append([&] {
+      RETURN_NOT_OK(write_options.writer_pre_finish(part_queue.second->writer().get()));
+      RETURN_NOT_OK(part_queue.second->writer()->Finish());
+      return write_options.writer_post_finish(part_queue.second->writer().get());
+    });
   }
   return task_group->Finish();
 }

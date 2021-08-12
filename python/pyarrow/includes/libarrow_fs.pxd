@@ -52,6 +52,10 @@ cdef extern from "arrow/filesystem/api.h" namespace "arrow::fs" nogil:
         c_bool allow_not_found
         c_bool recursive
 
+    cdef cppclass CFileLocator "arrow::fs::FileLocator":
+        shared_ptr[CFileSystem] filesystem
+        c_string path
+
     cdef cppclass CFileSystem "arrow::fs::FileSystem":
         shared_ptr[CFileSystem] shared_from_this()
         c_string type_name() const
@@ -150,6 +154,7 @@ cdef extern from "arrow/filesystem/api.h" namespace "arrow::fs" nogil:
         c_string endpoint_override
         c_string scheme
         c_bool background_writes
+        shared_ptr[const CKeyValueMetadata] default_metadata
         c_string role_arn
         c_string session_name
         c_string external_id

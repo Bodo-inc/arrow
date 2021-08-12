@@ -19,7 +19,8 @@
 
 # Base class for RecordBatch and Table for S3 method dispatch only.
 # Does not exist in C++ class hierarchy
-ArrowTabular <- R6Class("ArrowTabular", inherit = ArrowObject,
+ArrowTabular <- R6Class("ArrowTabular",
+  inherit = ArrowObject,
   public = list(
     ToString = function() ToString_tabular(self),
     Take = function(i) {
@@ -212,7 +213,7 @@ head.ArrowTabular <- head.ArrowDatum
 tail.ArrowTabular <- tail.ArrowDatum
 
 #' @export
-na.fail.ArrowTabular <- function(object, ...){
+na.fail.ArrowTabular <- function(object, ...) {
   for (col in seq_len(object$num_columns)) {
     if (object$column(col - 1L)$null_count > 0) {
       stop("missing values in object", call. = FALSE)
@@ -222,8 +223,8 @@ na.fail.ArrowTabular <- function(object, ...){
 }
 
 #' @export
-na.omit.ArrowTabular <- function(object, ...){
-  not_na <- map(object$columns, ~call_function("is_valid", .x))
+na.omit.ArrowTabular <- function(object, ...) {
+  not_na <- map(object$columns, ~ call_function("is_valid", .x))
   not_na_agg <- Reduce("&", not_na)
   object$Filter(not_na_agg)
 }

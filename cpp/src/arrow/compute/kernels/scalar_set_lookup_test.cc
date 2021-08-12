@@ -57,7 +57,7 @@ void CheckIsIn(const std::shared_ptr<DataType>& type, const std::string& input_j
   ASSERT_OK_AND_ASSIGN(Datum actual_datum,
                        IsIn(input, SetLookupOptions(value_set, skip_nulls)));
   std::shared_ptr<Array> actual = actual_datum.make_array();
-  ASSERT_OK(actual->ValidateFull());
+  ValidateOutput(actual_datum);
   AssertArraysEqual(*expected, *actual, /*verbose=*/true);
 }
 
@@ -68,7 +68,7 @@ void CheckIsInChunked(const std::shared_ptr<ChunkedArray>& input,
   ASSERT_OK_AND_ASSIGN(Datum actual_datum,
                        IsIn(input, SetLookupOptions(value_set, skip_nulls)));
   auto actual = actual_datum.chunked_array();
-  ASSERT_OK(actual->ValidateFull());
+  ValidateOutput(actual_datum);
   AssertChunkedEqual(*expected, *actual);
 }
 
@@ -89,7 +89,7 @@ void CheckIsInDictionary(const std::shared_ptr<DataType>& type,
   ASSERT_OK_AND_ASSIGN(Datum actual_datum,
                        IsIn(input, SetLookupOptions(value_set, skip_nulls)));
   std::shared_ptr<Array> actual = actual_datum.make_array();
-  ASSERT_OK(actual->ValidateFull());
+  ValidateOutput(actual_datum);
   AssertArraysEqual(*expected, *actual, /*verbose=*/true);
 }
 
@@ -219,7 +219,7 @@ TEST_F(TestIsInKernel, Boolean) {
             "[false, true, false, false, true]", /*skip_nulls=*/true);
 }
 
-TYPED_TEST_SUITE(TestIsInKernelBinary, BinaryTypes);
+TYPED_TEST_SUITE(TestIsInKernelBinary, BinaryArrowTypes);
 
 TYPED_TEST(TestIsInKernelBinary, Binary) {
   auto type = TypeTraits<TypeParam>::type_singleton();
@@ -436,7 +436,7 @@ class TestIndexInKernel : public ::testing::Test {
     SetLookupOptions options(value_set, skip_nulls);
     ASSERT_OK_AND_ASSIGN(Datum actual_datum, IndexIn(input, options));
     std::shared_ptr<Array> actual = actual_datum.make_array();
-    ASSERT_OK(actual->ValidateFull());
+    ValidateOutput(actual_datum);
     AssertArraysEqual(*expected, *actual, /*verbose=*/true);
   }
 
@@ -447,7 +447,7 @@ class TestIndexInKernel : public ::testing::Test {
     ASSERT_OK_AND_ASSIGN(Datum actual,
                          IndexIn(input, SetLookupOptions(value_set, skip_nulls)));
     ASSERT_EQ(Datum::CHUNKED_ARRAY, actual.kind());
-    ASSERT_OK(actual.chunked_array()->ValidateFull());
+    ValidateOutput(actual);
     AssertChunkedEqual(*expected, *actual.chunked_array());
   }
 
@@ -469,7 +469,7 @@ class TestIndexInKernel : public ::testing::Test {
     SetLookupOptions options(value_set, skip_nulls);
     ASSERT_OK_AND_ASSIGN(Datum actual_datum, IndexIn(input, options));
     std::shared_ptr<Array> actual = actual_datum.make_array();
-    ASSERT_OK(actual->ValidateFull());
+    ValidateOutput(actual_datum);
     AssertArraysEqual(*expected, *actual, /*verbose=*/true);
   }
 };
@@ -678,7 +678,7 @@ TEST_F(TestIndexInKernel, Boolean) {
 template <typename Type>
 class TestIndexInKernelBinary : public TestIndexInKernel {};
 
-TYPED_TEST_SUITE(TestIndexInKernelBinary, BinaryTypes);
+TYPED_TEST_SUITE(TestIndexInKernelBinary, BinaryArrowTypes);
 
 TYPED_TEST(TestIndexInKernelBinary, Binary) {
   auto type = TypeTraits<TypeParam>::type_singleton();

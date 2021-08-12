@@ -38,7 +38,8 @@ be called directly on Arrow objects, as well as some tidyverse-flavored versions
 available inside \code{dplyr} verbs.
 }
 \examples{
-list_compute_functions() 
-list_compute_functions(pattern = "^UTF8", ignore.case = TRUE)
-list_compute_functions(pattern = "^is", invert = TRUE)
+\dontshow{if (arrow_available()) (if (getRversion() >= "3.4") withAutoprint else force)(\{ # examplesIf}
+available_funcs <- list_compute_functions()
+utf8_funcs <- list_compute_functions(pattern = "^UTF8", ignore.case = TRUE)
+\dontshow{\}) # examplesIf}
 }

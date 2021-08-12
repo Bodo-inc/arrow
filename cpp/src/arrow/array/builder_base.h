@@ -50,6 +50,8 @@ class ARROW_EXPORT ArrayBuilder {
  public:
   explicit ArrayBuilder(MemoryPool* pool) : pool_(pool), null_bitmap_builder_(pool) {}
 
+  ARROW_DEFAULT_MOVE_AND_ASSIGN(ArrayBuilder);
+
   virtual ~ArrayBuilder() = default;
 
   /// For nested types. Since the objects are owned by this class instance, we
@@ -115,6 +117,11 @@ class ARROW_EXPORT ArrayBuilder {
   /// memory slot is guaranteed to be initialized.
   /// This method is useful when appending null values to a parent nested type.
   virtual Status AppendEmptyValues(int64_t length) = 0;
+
+  /// \brief Append a value from a scalar
+  Status AppendScalar(const Scalar& scalar);
+  Status AppendScalar(const Scalar& scalar, int64_t n_repeats);
+  Status AppendScalars(const ScalarVector& scalars);
 
   /// For cases where raw data was memcpy'd into the internal buffers, allows us
   /// to advance the length of the builder. It is your responsibility to use
